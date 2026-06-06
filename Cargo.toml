@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "aether-core",
+    "aether-cli",
+    "aether-api",
+    "aether-web",
+    "aetherci",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["AetherVC Team"]
+license = "MIT"
+repository = "https://github.com/aethervc/aether-vc"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Logging & Error
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Web
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Git
+git2 = { version = "0.19", features = ["vendored-libgit2"] }
+
+# Testing
+tempfile = "3"
+
+# Config
+config = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

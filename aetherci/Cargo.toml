@@ -1,0 +1,21 @@
+[package]
+name = "aetherci"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AetherCommit Intelligence — 代码变更语义理解与意图文档生成系统"
+
+[dependencies]
+aether-core = { path = "../aether-core" }
+
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
