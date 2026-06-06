@@ -167,6 +167,21 @@ mod tests {
         fn repo_path(&self) -> &std::path::Path {
             std::path::Path::new(".")
         }
+
+        async fn get_diff_between(&self, _from_ref: &str, _to_ref: &str) -> Result<String> {
+            Ok("diff --git a/lib.rs b/lib.rs\n+pub fn new() {}".to_string())
+        }
+
+        async fn get_commits_in_range(&self, _from_ref: &str, _to_ref: &str) -> Result<Vec<Commit>> {
+            let commit = Commit::new(
+                "abc123",
+                "feat: add login module",
+                Author::new("test", "test@test.com"),
+                chrono::Utc::now(),
+                vec![],
+            );
+            Ok(vec![commit])
+        }
     }
 
     #[tokio::test]

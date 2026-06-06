@@ -25,10 +25,14 @@ name = "aether-cli"
 version = "0.1.0"
 dependencies = [
  "aether-core",
+ "aetherci",
  "anyhow",
+ "chrono",
  "clap",
+ "lazy_static",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -50,6 +54,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -59,6 +64,22 @@ name = "aether-web"
 version = "0.1.0"
 dependencies = [
  "aether-core",
+]
+
+[[package]]
+name = "aetherci"
+version = "0.1.0"
+dependencies = [
+ "aether-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
