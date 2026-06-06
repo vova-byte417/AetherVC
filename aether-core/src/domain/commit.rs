@@ -180,7 +180,7 @@ impl std::fmt::Display for ChangeCategory {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub enum RiskLevel {
     Low,
     Medium,

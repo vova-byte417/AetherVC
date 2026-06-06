@@ -7,14 +7,16 @@ use aether_core::batch::{BatchAnalyzer, BatchOptions, ScoredCommit};
 use aether_core::config::{ConfigLoader, AetherConfig};
 use aether_core::digest::{DigestAggregator, DigestOptions, DigestSummarizer};
 use aether_core::llm::client::MockLLMClient;
+use aether_core::llm::factory::LLMFactory;
 use aether_core::nlp::context::ContextManager;
 use aether_core::nlp::executor::CommandExecutor;
 use aether_core::nlp::parser::NaturalLanguageParser;
 use aether_core::review::{GateEngine, ReviewItem, ReviewQueue, ReviewStatus};
 use aether_core::semantic::embedder::MockEmbedder;
 use aether_core::semantic::indexer::SemanticIndexer;
+use aether_core::semantic::knowledge_graph::KnowledgeGraphEngine;
 use aether_core::storage::git::{GitOperations, GitRepository};
-use aether_core::storage::graph_db::InMemoryGraphStore;
+use aether_core::storage::graph_db::{InMemoryGraphStore, GraphStore};
 use aether_core::storage::vector_db::InMemoryVectorStore;
 use aether_core::verify::{VerificationRunner, VerificationReport, VerifyMode};
 use aether_core::domain::commit::{Commit, CurrentState};
@@ -224,6 +226,12 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+
+    /// 知识图谱查询
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
 }
 
 // ─── 子命令枚举 ───
@@ -295,6 +303,32 @@ enum HookAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum GraphAction {
+    /// 索引仓库到知识图谱
+    Index {
+        #[arg(short, long)]
+        full: bool,
+    },
+    /// 查询模块变更历史
+    QueryModule {
+        module: String,
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// 查询作者贡献
+    QueryAuthor {
+        author: String,
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// 查询提交影响的模块
+    AffectedModules {
+        #[arg(default_value = "HEAD")]
+        commit_hash: String,
+    },
+}
+
 fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("aether=info".parse().unwrap()))
@@ -346,6 +380,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hook { action } => {
             cmd_hook(action, &cli.repo_path).await
         }
+        Commands::Graph { action } => {
+            cmd_graph(action, &cli.repo_path).await
+        }
     }
 }
 
@@ -358,7 +395,8 @@ fn create_app_context(repo_path: &str) -> anyhow::Result<(
     let vector_store = Arc::new(InMemoryVectorStore::new());
     let graph_store = Arc::new(InMemoryGraphStore::new());
     let embedder = Arc::new(MockEmbedder::default());
-    let llm_client = Arc::new(MockLLMClient::new());
+    let llm_client: Arc<dyn aether_core::llm::client::LLMClient> = get_llm_client(repo_path)
+        .unwrap_or_else(|| Arc::new(MockLLMClient::new()));
 
     let agent_context = Arc::new(
         aether_core::agents::base::AgentContext::new(
@@ -393,6 +431,118 @@ async fn cmd_init(path: &str) -> anyhow::Result<()> {
         Err(_) => {
             println!("  ✗ No Git repository found at {}", path);
             println!("  Hint: run 'git init' first, or use 'aether init' in an existing repo");
+        }
+    }
+
+    Ok(())
+}
+
+// ─── LLM Client 工厂 ───
+
+/// 尝试从配置文件或环境变量创建真实 LLM 客户端
+fn get_llm_client(repo_path: &str) -> Option<Arc<dyn aether_core::llm::client::LLMClient>> {
+    // 1. 尝试从环境变量创建
+    if let Ok(client) = LLMFactory::from_env() {
+        eprintln!("[AetherVC] 使用 DeepSeek LLM (环境变量)");
+        return Some(client);
+    }
+
+    // 2. 尝试从 .aether/config.toml 读取
+    let config_path = std::path::Path::new(repo_path).join(".aether").join("config.toml");
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = toml::from_str::<AetherConfig>(&content) {
+                if let Ok(client) = LLMFactory::create(&config.llm) {
+                    eprintln!("[AetherVC] 使用 LLM (配置文件): {} / {}",
+                        config.llm.provider, config.llm.model);
+                    return Some(client);
+                }
+            }
+        }
+    }
+
+    eprintln!("[AetherVC] 未配置 LLM，使用规则引擎降级");
+    None
+}
+
+// ─── Graph 命令 ───
+
+async fn cmd_graph(action: GraphAction, repo_path: &str) -> anyhow::Result<()> {
+    let graph_store = Arc::new(InMemoryGraphStore::new());
+    let engine = KnowledgeGraphEngine::new(graph_store.clone());
+
+    match action {
+        GraphAction::Index { full: _ } => {
+            println!("索引提交到知识图谱...");
+            match GitRepository::open(repo_path) {
+                Ok(repo) => {
+                    match repo.list_commits().await {
+                        Ok(commits) => {
+                            let count = engine.index_commits(&commits).await?;
+                            println!("✓ 已索引 {} 个 commits", count);
+                            println!("  节点类型: Commit, Author, Module");
+                            println!("  关系类型: AUTHORED, MODIFIES, HIGH_RISK");
+                        }
+                        Err(e) => {
+                            println!("✗ 获取 commits 失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("✗ 打开 Git 仓库失败: {}", e);
+                }
+            }
+        }
+        GraphAction::QueryModule { module, limit: _ } => {
+            println!("查询模块 '{}' 的变更历史...", module);
+            let node_id = format!("module:{}", module);
+            match graph_store.get_dependencies(&node_id).await {
+                Ok(deps) => {
+                    if deps.is_empty() {
+                        println!("暂无相关记录。请先运行 'aether graph index'。");
+                    } else {
+                        println!("直接关联的 commits ({})：", deps.len());
+                        for dep in deps.iter().take(20) {
+                            println!("  - {}", dep);
+                        }
+                    }
+                }
+                Err(e) => println!("✗ 查询失败: {}", e),
+            }
+        }
+        GraphAction::QueryAuthor { author, limit: _ } => {
+            println!("查询作者 '{}' 的贡献...", author);
+            let node_id = format!("author:{}", author);
+            match graph_store.get_dependencies(&node_id).await {
+                Ok(deps) => {
+                    if deps.is_empty() {
+                        println!("暂无相关记录。请先运行 'aether graph index'。");
+                    } else {
+                        println!("该作者的 commits ({})：", deps.len());
+                        for dep in deps.iter().take(20) {
+                            println!("  - {}", dep);
+                        }
+                    }
+                }
+                Err(e) => println!("✗ 查询失败: {}", e),
+            }
+        }
+        GraphAction::AffectedModules { commit_hash } => {
+            println!("查询 commit '{}' 影响的模块...", commit_hash);
+            let graph = KnowledgeGraphEngine::new(graph_store.clone());
+            match graph.get_affected_modules(&commit_hash).await {
+                Ok(modules) => {
+                    if modules.is_empty() {
+                        println!("未找到关联模块。请先运行 'aether graph index'。");
+                    } else {
+                        println!("受影响的模块 ({})：", modules.len());
+                        for m in &modules {
+                            println!("  - {}", m);
+                        }
+                    }
+                }
+                Err(e) => println!("✗ 查询失败: {}", e),
+            }
         }
     }
 
@@ -553,8 +703,9 @@ async fn cmd_analyze(commit_range: &str, json: bool, quick: bool, repo_path: &st
     let pipeline = if quick {
         SemanticDiffPipeline::default_pipeline()
     } else {
-        // 带 LLM 的 Pipeline
-        let llm = Arc::new(MockLLMClient::new());
+        // 带 LLM 的 Pipeline - 优先使用真实 LLM
+        let llm = get_llm_client(repo_path)
+            .unwrap_or_else(|| Arc::new(MockLLMClient::new()));
         SemanticDiffPipeline::new(Some(llm), None)
     };
 

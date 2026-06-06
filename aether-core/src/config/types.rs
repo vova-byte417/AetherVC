@@ -302,9 +302,12 @@ impl Default for VerifyAdvanced {
 /// LLM 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMConfig {
-    /// Provider: openai / claude / local
+    /// Provider: deepseek / openai / openai-compatible / claude / local
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// API Base URL（openai-compatible 时必填）
+    #[serde(default)]
+    pub api_base: String,
     /// API Key（支持环境变量引用 ${VAR_NAME}）
     #[serde(default)]
     pub api_key: String,
@@ -322,17 +325,18 @@ pub struct LLMConfig {
     pub fallback: LLMFallbackConfig,
 }
 
-fn default_provider() -> String { "openai".into() }
-fn default_model() -> String { "gpt-4o".into() }
+fn default_provider() -> String { "deepseek".into() }
+fn default_model() -> String { "deepseek-chat".into() }
 fn default_max_tokens() -> u32 { 4000 }
 fn default_temperature() -> f32 { 0.1 }
 
 impl Default for LLMConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".into(),
+            provider: "deepseek".into(),
+            api_base: String::new(),
             api_key: String::new(),
-            model: "gpt-4o".into(),
+            model: "deepseek-chat".into(),
             max_tokens: 4000,
             temperature: 0.1,
             fallback: LLMFallbackConfig::default(),

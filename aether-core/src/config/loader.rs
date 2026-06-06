@@ -182,7 +182,7 @@ mod tests {
         let config = loader.load().unwrap();
         assert!(config.gate.enabled);
         assert!(config.verify.enabled);
-        assert_eq!(config.llm.provider, "openai");
+        assert_eq!(config.llm.provider, "deepseek");
     }
 
     #[test]
