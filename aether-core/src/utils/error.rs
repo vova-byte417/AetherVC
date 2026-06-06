@@ -14,6 +14,9 @@ pub enum AetherError {
     #[error("Graph store error: {0}")]
     GraphStore(String),
 
+    #[error("Storage error: {0}")]
+    Storage(String),
+
     #[error("Embedding error: {0}")]
     Embedding(String),
 

@@ -1,4 +1,5 @@
 use crate::agents::base::{Agent, AgentContext, AgentStatus};
+use crate::config::types::RollbackConfig;
 use crate::domain::agent::{AgentResult, AgentTask, AgentType};
 use crate::utils::Result;
 use async_trait::async_trait;
@@ -23,11 +24,14 @@ impl AgentOrchestrator {
         self.agents.insert(agent.agent_type(), agent);
     }
 
-    /// 从上下文创建所有默认 Agent 并注册
+    /// 从上下文创建所有默认 Agent 并注册（全部 6 个）
     pub fn with_all_agents(mut self, context: Arc<AgentContext>) -> Self {
         self.register(Arc::new(super::semantic_interpreter::SemanticInterpreterAgent::new(context.clone())));
         self.register(Arc::new(super::recovery::CrossCommitRecoveryAgent::new(context.clone())));
-        self.register(Arc::new(super::merge::MergeAgent::new(context)));
+        self.register(Arc::new(super::merge::MergeAgent::new(context.clone())));
+        self.register(Arc::new(super::coordinator::MultiAgentCoordinatorAgent::new(context.clone())));
+        self.register(Arc::new(super::validation::ValidationRiskAgent::new(context.clone())));
+        self.register(Arc::new(super::rollback::RollbackAgent::new(context, RollbackConfig::default())));
         self
     }
 
@@ -102,10 +106,13 @@ mod tests {
     fn test_orchestrator_with_agents() {
         let orch = AgentOrchestrator::new().with_all_agents(test_context());
         let agents = orch.registered_agents();
-        assert_eq!(agents.len(), 3);
+        assert_eq!(agents.len(), 6);
         assert!(agents.contains(&AgentType::SemanticInterpreter));
         assert!(agents.contains(&AgentType::CrossCommitRecovery));
         assert!(agents.contains(&AgentType::Merge));
+        assert!(agents.contains(&AgentType::MultiAgentCoordinator));
+        assert!(agents.contains(&AgentType::ValidationRisk));
+        assert!(agents.contains(&AgentType::Rollback));
     }
 
     #[tokio::test]

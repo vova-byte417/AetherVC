@@ -92,12 +92,15 @@ async fn test_full_search_workflow() {
 async fn test_orchestrator_all_agents_registered() {
     let (orchestrator, _) = create_test_orchestrator();
     let agents = orchestrator.registered_agents();
-    assert_eq!(agents.len(), 3);
+    assert_eq!(agents.len(), 6);
 
     use aether_core::domain::agent::AgentType;
     assert!(agents.contains(&AgentType::SemanticInterpreter));
     assert!(agents.contains(&AgentType::CrossCommitRecovery));
     assert!(agents.contains(&AgentType::Merge));
+    assert!(agents.contains(&AgentType::MultiAgentCoordinator));
+    assert!(agents.contains(&AgentType::ValidationRisk));
+    assert!(agents.contains(&AgentType::Rollback));
 }
 
 #[tokio::test]

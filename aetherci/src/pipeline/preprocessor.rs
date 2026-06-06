@@ -313,7 +313,8 @@ impl Preprocessor {
 
     /// 从前缀后提取标识符名称
     fn extract_name_after<'a>(text: &'a str, prefix: &str) -> Option<String> {
-        let after = text.strip_prefix(prefix)?;
+        let trimmed = text.trim_start();
+        let after = trimmed.strip_prefix(prefix)?;
         let name = after
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')

@@ -1,3 +1,15 @@
+//! 嵌入器模块 - 文本向量化
+//!
+//! 提供 Embedder trait 及多种实现：
+//! - MockEmbedder: 确定性测试向量
+//! - OpenAIEmbedder: 调用 OpenAI 兼容 Embedding API
+//! - RetryEmbedder: 带重试和降级的装饰器
+//! - EmbedderFactory: 根据配置自动创建合适的 Embedder
+
+pub mod openai;
+pub mod retry;
+pub mod factory;
+
 use crate::utils::Result;
 
 /// 嵌入器抽象 - 将文本转换为向量

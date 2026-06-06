@@ -3,23 +3,24 @@
 //! 命令行入口，提供自然语言驱动的版本控制操作
 
 use aether_core::agents::orchestrator::AgentOrchestrator;
-use aether_core::batch::{BatchAnalyzer, BatchOptions, ScoredCommit};
+use aether_core::batch::{BatchAnalyzer, BatchOptions};
 use aether_core::config::{ConfigLoader, AetherConfig};
 use aether_core::digest::{DigestAggregator, DigestOptions, DigestSummarizer};
-use aether_core::llm::client::MockLLMClient;
 use aether_core::llm::factory::LLMFactory;
 use aether_core::nlp::context::ContextManager;
 use aether_core::nlp::executor::CommandExecutor;
 use aether_core::nlp::parser::NaturalLanguageParser;
-use aether_core::review::{GateEngine, ReviewItem, ReviewQueue, ReviewStatus};
-use aether_core::semantic::embedder::MockEmbedder;
+use aether_core::review::{GateEngine, ReviewQueue};
+use aether_core::semantic::embedder::factory::EmbedderFactory;
 use aether_core::semantic::indexer::SemanticIndexer;
 use aether_core::semantic::knowledge_graph::KnowledgeGraphEngine;
 use aether_core::storage::git::{GitOperations, GitRepository};
 use aether_core::storage::graph_db::{InMemoryGraphStore, GraphStore};
 use aether_core::storage::vector_db::InMemoryVectorStore;
 use aether_core::verify::{VerificationRunner, VerificationReport, VerifyMode};
+use aether_core::domain::agent::{AgentTask, RollbackRecord, RollbackStatus, TagValidationReport};
 use aether_core::domain::commit::{Commit, CurrentState};
+use aether_core::workflow::{WorkflowOrchestrator, WorkflowType};
 
 use aetherci::pipeline::orchestrator::SemanticDiffPipeline;
 use aetherci::domain::PipelineInput;
@@ -232,6 +233,36 @@ enum Commands {
         #[command(subcommand)]
         action: GraphAction,
     },
+
+    /// 端到端工作流编排
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+
+    /// 智能回滚管理
+    Rollback {
+        #[command(subcommand)]
+        action: RollbackSub,
+    },
+
+    /// 批量 Tag 验证
+    VerifyTag {
+        /// Tag 名称列表 或 keyword
+        #[arg()]
+        tags: Vec<String>,
+
+        /// 排序方式: risk-asc, risk-desc, chronological
+        #[arg(short, long, default_value = "risk-asc")]
+        order_by: String,
+
+        /// JSON 格式输出
+        #[arg(short, long)]
+        json: bool,
+    },
+
+    /// 显示 AetherVC 状态
+    Status,
 }
 
 // ─── 子命令枚举 ───
@@ -329,6 +360,55 @@ enum GraphAction {
     },
 }
 
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// 日常消化：摘要 + 风险排序 + 门控
+    Digest {
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// 多 Agent 协调：冲突检测 + 合并建议
+    Coordinate {
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Tag 验证：搜索 + 排序 + 验证
+    VerifyTags {
+        #[arg(long)]
+        keyword: Option<String>,
+        #[arg(long, default_value = "15")]
+        count: usize,
+    },
+    /// 完整 CI 流程
+    FullCi {
+        #[arg(long)]
+        watch: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RollbackSub {
+    /// 分析指定 commit 是否需要回滚
+    Analyze {
+        #[arg(default_value = "HEAD")]
+        commit_hash: String,
+    },
+    /// 执行回滚
+    Execute {
+        commit_hash: String,
+        #[arg(long, default_value = "revert")]
+        method: String,
+        #[arg(long)]
+        hard: bool,
+    },
+    /// 查看回滚历史
+    History,
+    /// 查看 Agent 信誉分
+    Reputation,
+}
+
 fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("aether=info".parse().unwrap()))
@@ -383,6 +463,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Graph { action } => {
             cmd_graph(action, &cli.repo_path).await
         }
+        Commands::Workflow { action } => {
+            cmd_workflow(action, &cli.repo_path).await
+        }
+        Commands::Rollback { action } => {
+            cmd_rollback_cli(action, &cli.repo_path).await
+        }
+        Commands::VerifyTag { tags, order_by, json } => {
+            cmd_verify_tag(&tags, &order_by, json, &cli.repo_path).await
+        }
+        Commands::Status => {
+            cmd_status(&cli.repo_path).await
+        }
     }
 }
 
@@ -390,13 +482,51 @@ fn create_app_context(repo_path: &str) -> anyhow::Result<(
     Arc<AgentOrchestrator>,
     Arc<SemanticIndexer>,
     Arc<ContextManager>,
+    AetherConfig,
 )> {
     let git_repo: Arc<dyn GitOperations> = Arc::new(GitRepository::new(repo_path));
-    let vector_store = Arc::new(InMemoryVectorStore::new());
-    let graph_store = Arc::new(InMemoryGraphStore::new());
-    let embedder = Arc::new(MockEmbedder::default());
-    let llm_client: Arc<dyn aether_core::llm::client::LLMClient> = get_llm_client(repo_path)
-        .unwrap_or_else(|| Arc::new(MockLLMClient::new()));
+
+    // 加载配置
+    let loader = ConfigLoader::new(repo_path);
+    let config = loader.load().unwrap_or_default();
+
+    // 根据配置选择存储后端
+    let (vector_store, graph_store): (
+        Arc<dyn aether_core::storage::vector_db::VectorStore>,
+        Arc<dyn aether_core::storage::graph_db::GraphStore>,
+    ) = if config.storage.backend == "persistent" {
+        let data_dir = std::path::Path::new(repo_path).join(&config.storage.data_dir);
+        let vector_dir = data_dir.join("vectors");
+        let graph_file = data_dir.join("graph").join("graph.json");
+
+        eprintln!("[AetherVC] 使用持久化存储: {} (backend={})",
+            data_dir.display(), config.storage.backend);
+
+        let vs = Arc::new(
+            aether_core::storage::vector_db::PersistentVectorStore::new(&vector_dir),
+        );
+        let gs = Arc::new(
+            aether_core::storage::graph_db::PersistentGraphStore::new(&graph_file),
+        );
+        (vs, gs)
+    } else {
+        eprintln!("[AetherVC] 使用内存存储 (重启后数据丢失)");
+        (
+            Arc::new(InMemoryVectorStore::new()),
+            Arc::new(InMemoryGraphStore::new()),
+        )
+    };
+
+    // 用 EmbedderFactory 创建 Embedder（配置优先，回退到 Mock）
+    let embedder = EmbedderFactory::create(&config.llm);
+
+    // 用 LLMFactory 创建 LLM 客户端（配置优先 → 环境变量 → Mock）
+    let llm_client = LLMFactory::from_config_or_env(&config.llm);
+
+    eprintln!("[AetherVC] LLM: {}, Embedder: {}维",
+        llm_client.model_name(),
+        embedder.dimension()
+    );
 
     let agent_context = Arc::new(
         aether_core::agents::base::AgentContext::new(
@@ -416,7 +546,7 @@ fn create_app_context(repo_path: &str) -> anyhow::Result<(
     ));
     let context_manager = Arc::new(ContextManager::new());
 
-    Ok((orchestrator, indexer, context_manager))
+    Ok((orchestrator, indexer, context_manager, config))
 }
 
 async fn cmd_init(path: &str) -> anyhow::Result<()> {
@@ -437,38 +567,21 @@ async fn cmd_init(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── LLM Client 工厂 ───
-
-/// 尝试从配置文件或环境变量创建真实 LLM 客户端
-fn get_llm_client(repo_path: &str) -> Option<Arc<dyn aether_core::llm::client::LLMClient>> {
-    // 1. 尝试从环境变量创建
-    if let Ok(client) = LLMFactory::from_env() {
-        eprintln!("[AetherVC] 使用 DeepSeek LLM (环境变量)");
-        return Some(client);
-    }
-
-    // 2. 尝试从 .aether/config.toml 读取
-    let config_path = std::path::Path::new(repo_path).join(".aether").join("config.toml");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = toml::from_str::<AetherConfig>(&content) {
-                if let Ok(client) = LLMFactory::create(&config.llm) {
-                    eprintln!("[AetherVC] 使用 LLM (配置文件): {} / {}",
-                        config.llm.provider, config.llm.model);
-                    return Some(client);
-                }
-            }
-        }
-    }
-
-    eprintln!("[AetherVC] 未配置 LLM，使用规则引擎降级");
-    None
-}
-
 // ─── Graph 命令 ───
 
 async fn cmd_graph(action: GraphAction, repo_path: &str) -> anyhow::Result<()> {
-    let graph_store = Arc::new(InMemoryGraphStore::new());
+    let loader = ConfigLoader::new(repo_path);
+    let config = loader.load().unwrap_or_default();
+
+    let graph_store: Arc<dyn aether_core::storage::graph_db::GraphStore> =
+        if config.storage.backend == "persistent" {
+            let data_dir = std::path::Path::new(repo_path).join(&config.storage.data_dir);
+            let graph_file = data_dir.join("graph").join("graph.json");
+            Arc::new(aether_core::storage::graph_db::PersistentGraphStore::new(&graph_file))
+        } else {
+            Arc::new(InMemoryGraphStore::new())
+        };
+
     let engine = KnowledgeGraphEngine::new(graph_store.clone());
 
     match action {
@@ -550,7 +663,7 @@ async fn cmd_graph(action: GraphAction, repo_path: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_do(command: &str, repo_path: &str) -> anyhow::Result<()> {
-    let (orchestrator, _indexer, _context_manager) = create_app_context(repo_path)?;
+    let (orchestrator, _indexer, _context_manager, _config) = create_app_context(repo_path)?;
     let parser = NaturalLanguageParser::new();
     let executor = CommandExecutor::new(orchestrator, repo_path.to_string());
 
@@ -573,7 +686,7 @@ async fn cmd_do(command: &str, repo_path: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_search(query: &str, limit: usize, repo_path: &str) -> anyhow::Result<()> {
-    let (_orchestrator, indexer, _ctx) = create_app_context(repo_path)?;
+    let (_orchestrator, indexer, _config_manager, _config) = create_app_context(repo_path)?;
 
     println!("搜索: \"{}\" (限制 {} 条结果)", query, limit);
     let results = indexer.search(query, limit, None).await?;
@@ -596,7 +709,7 @@ async fn cmd_search(query: &str, limit: usize, repo_path: &str) -> anyhow::Resul
 }
 
 async fn cmd_index(repo_path: &str) -> anyhow::Result<()> {
-    let (_orchestrator, indexer, _ctx) = create_app_context(repo_path)?;
+    let (_orchestrator, indexer, _config_manager, _config) = create_app_context(repo_path)?;
 
     println!("正在构建语义索引...");
     let report = indexer.index_all_commits().await?;
@@ -610,7 +723,7 @@ async fn cmd_index(repo_path: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_recover(description: &str, repo_path: &str) -> anyhow::Result<()> {
-    let (orchestrator, _indexer, _ctx) = create_app_context(repo_path)?;
+    let (orchestrator, _indexer, _config_manager, _config) = create_app_context(repo_path)?;
     let executor = CommandExecutor::new(orchestrator, repo_path.to_string());
     let parser = NaturalLanguageParser::new();
 
@@ -633,7 +746,7 @@ async fn cmd_recover(description: &str, repo_path: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_merge(prs: &[String], repo_path: &str) -> anyhow::Result<()> {
-    let (orchestrator, _indexer, _ctx) = create_app_context(repo_path)?;
+    let (orchestrator, _indexer, _config_manager, _config) = create_app_context(repo_path)?;
     let executor = CommandExecutor::new(orchestrator, repo_path.to_string());
     let parser = NaturalLanguageParser::new();
 
@@ -703,9 +816,9 @@ async fn cmd_analyze(commit_range: &str, json: bool, quick: bool, repo_path: &st
     let pipeline = if quick {
         SemanticDiffPipeline::default_pipeline()
     } else {
-        // 带 LLM 的 Pipeline - 优先使用真实 LLM
-        let llm = get_llm_client(repo_path)
-            .unwrap_or_else(|| Arc::new(MockLLMClient::new()));
+        // 带 LLM 的 Pipeline - 使用配置/环境变量
+        let (_orchestrator, _indexer, _config_manager, config) = create_app_context(repo_path)?;
+        let llm = LLMFactory::from_config_or_env(&config.llm);
         SemanticDiffPipeline::new(Some(llm), None)
     };
 
@@ -1092,8 +1205,6 @@ lazy_static::lazy_static! {
     static ref GLOBAL_REVIEW_QUEUE: Mutex<ReviewQueue> = Mutex::new(ReviewQueue::new());
 }
 
-use lazy_static::lazy_static;
-
 /// `aether review` - 审核队列管理
 async fn cmd_review(action: ReviewAction, _repo_path: &str) -> anyhow::Result<()> {
     let mut queue = GLOBAL_REVIEW_QUEUE.lock().unwrap();
@@ -1204,6 +1315,235 @@ async fn cmd_verify(
             std::fs::write(&report_path, serde_json::to_string_pretty(&result)?)?;
             println!("验证报告已保存至: {}", report_path);
         }
+    }
+
+    Ok(())
+}
+
+// ─── 工作流命令 ───
+
+async fn cmd_workflow(action: WorkflowAction, repo_path: &str) -> anyhow::Result<()> {
+    let (orchestrator, _indexer, _config_manager, config) = create_app_context(repo_path)?;
+    let wf = WorkflowOrchestrator::new(orchestrator, config, repo_path);
+
+    match action {
+        WorkflowAction::Digest { since: _, until: _ } => {
+            let result = wf.execute(WorkflowType::Digest).await?;
+            print_workflow_result(&result);
+        }
+        WorkflowAction::Coordinate { since: _ } => {
+            let result = wf.execute(WorkflowType::Coordinate).await?;
+            print_workflow_result(&result);
+        }
+        WorkflowAction::VerifyTags { keyword: _, count: _ } => {
+            let result = wf.execute(WorkflowType::VerifyTags).await?;
+            print_workflow_result(&result);
+        }
+        WorkflowAction::FullCi { watch } => {
+            if watch {
+                println!("FullCI 监控模式启动（每 30 秒检查一次）...");
+                loop {
+                    let result = wf.execute(WorkflowType::FullCI).await?;
+                    print_workflow_result(&result);
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            } else {
+                let result = wf.execute(WorkflowType::FullCI).await?;
+                print_workflow_result(&result);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_workflow_result(result: &aether_core::workflow::WorkflowResult) {
+    println!("┌─────────────────────────────────────────┐");
+    println!("│  工作流: {}  {}│",
+        result.workflow_type,
+        if result.success { "✅" } else { "❌" }
+    );
+    println!("│  耗时: {}ms", result.duration_ms);
+    println!("│  {}", result.message);
+    if let Some(ref data) = result.data {
+        println!("│  ─────────────────────────────────────");
+        if let Ok(pretty) = serde_json::to_string_pretty(data) {
+            for line in pretty.lines().take(20) {
+                println!("│  {}", line);
+            }
+        }
+    }
+    println!("└─────────────────────────────────────────┘");
+}
+
+// ─── 回滚命令 ───
+
+async fn cmd_rollback_cli(action: RollbackSub, repo_path: &str) -> anyhow::Result<()> {
+    let (orchestrator, _indexer, _config_manager, config) = create_app_context(repo_path)?;
+
+    match action {
+        RollbackSub::Analyze { commit_hash } => {
+            let task = AgentTask::new("analyze_rollback", serde_json::json!({
+                "commit_hash": commit_hash,
+                "verification_result": null,
+            }));
+            let result = orchestrator.execute_task(task).await?;
+            println!("回滚分析: {}", &commit_hash[..commit_hash.len().min(8)]);
+            let needs = result.output.get("needs_rollback").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("  需要回滚: {}", if needs { "是 ⚠" } else { "否" });
+            if let Some(action) = result.output.get("suggested_action") {
+                println!("  建议操作: {}", action);
+            }
+        }
+        RollbackSub::Execute { commit_hash, method, hard } => {
+            let action = if method == "reset" {
+                serde_json::json!({"type": "reset", "target": commit_hash, "hard": hard})
+            } else {
+                serde_json::json!({"type": "revert"})
+            };
+            let task = AgentTask::new("execute_rollback", serde_json::json!({
+                "commit_hash": commit_hash,
+                "action": action,
+                "require_approval": true,
+            }));
+            let result = orchestrator.execute_task(task).await?;
+            if result.success {
+                if let Ok(record) = serde_json::from_value::<RollbackRecord>(result.output.clone()) {
+                    match record.status {
+                        RollbackStatus::Executed => {
+                            println!("✅ 回滚已执行: {}", &commit_hash[..8]);
+                            if let Some(ref rev) = record.revert_commit {
+                                println!("   Revert commit: {}", rev);
+                            }
+                        }
+                        RollbackStatus::PendingApproval => {
+                            println!("⏳ 回滚待审批: {}", record.reason);
+                        }
+                        RollbackStatus::Failed(ref e) => {
+                            println!("❌ 回滚失败: {}", e);
+                        }
+                        _ => println!("回滚状态: {:?}", record.status),
+                    }
+                }
+            } else {
+                println!("❌ 回滚执行失败: {:?}", result.error_message);
+            }
+        }
+        RollbackSub::History => {
+            let task = AgentTask::new("rollback_history", serde_json::json!({}));
+            let result = orchestrator.execute_task(task).await?;
+            if let Ok(records) = serde_json::from_value::<Vec<RollbackRecord>>(result.output) {
+                if records.is_empty() {
+                    println!("回滚历史为空");
+                } else {
+                    for r in &records {
+                        println!("  {} {} {:?} {}",
+                            r.id,
+                            &r.rolled_back_commit[..std::cmp::min(8, r.rolled_back_commit.len())],
+                            r.status,
+                            r.agent_name
+                        );
+                    }
+                }
+            }
+        }
+        RollbackSub::Reputation => {
+            let task = AgentTask::new("reputation", serde_json::json!({}));
+            let result = orchestrator.execute_task(task).await?;
+            println!("Agent 信誉分:");
+            if let Some(map) = result.output.as_object() {
+                for (name, score) in map {
+                    if let Some(s) = score.as_f64() {
+                        let emoji = if s > 0.9 { "🟢" } else if s > 0.7 { "🟡" } else { "🔴" };
+                        println!("  {} {}: {:.2}", emoji, name, s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── Tag 验证命令 ───
+
+async fn cmd_verify_tag(tags: &[String], order_by: &str, json: bool, repo_path: &str) -> anyhow::Result<()> {
+    let (orchestrator, _indexer, _config_manager, _config) = create_app_context(repo_path)?;
+
+    let task = AgentTask::new("validate_tag", serde_json::json!({
+        "tags": tags,
+        "order_by": order_by,
+        "max_tags": tags.len().max(15),
+    }));
+
+    let result = orchestrator.execute_task(task).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result.output)?);
+    } else {
+        if let Ok(reports) = serde_json::from_value::<Vec<TagValidationReport>>(result.output.clone()) {
+            if reports.is_empty() {
+                println!("未找到匹配的 Tag");
+            } else {
+                println!("┌──────┬──────────┬────────┬────────────────────┐");
+                println!("│ 风险 │ Tag      │ Agent  │ 结论               │");
+                println!("├──────┼──────────┼────────┼────────────────────┤");
+                for r in &reports {
+                    let risk_icon = match r.overall_conclusion.as_str() {
+                        "pass" => "🟢",
+                        "conditional_pass" => "🟡",
+                        _ => "🔴",
+                    };
+                    println!("│ {} │ {:8} │ {:6} │ {:18} │",
+                        risk_icon,
+                        &r.tag[..r.tag.len().min(8)],
+                        &r.agent[..r.agent.len().min(6)],
+                        r.overall_conclusion
+                    );
+                }
+                println!("└──────┴──────────┴────────┴────────────────────┘");
+                println!("总计: {} 个 Tag, {} pass, {} conditional, {} fail",
+                    reports.len(),
+                    reports.iter().filter(|r| r.overall_conclusion == "pass").count(),
+                    reports.iter().filter(|r| r.overall_conclusion == "conditional_pass").count(),
+                    reports.iter().filter(|r| r.overall_conclusion == "fail").count(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── 状态命令 ───
+
+async fn cmd_status(repo_path: &str) -> anyhow::Result<()> {
+    let (_orchestrator, indexer, _config_manager, config) = create_app_context(repo_path)?;
+
+    let stats = indexer.stats().await?;
+
+    println!("AetherVC v0.3.0");
+    println!("  仓库：{}", repo_path);
+    println!("  语义索引：✅ 已构建 ({} 个 commit)", stats.total_points);
+    println!("  LLM Provider：{} ({})",
+        config.llm.provider,
+        config.llm.model
+    );
+    println!("  Embedder：{} ({} 维)",
+        config.llm.embedding_model,
+        // 实际维度从 embedder 获取，这里从配置显示
+        if config.llm.embedding_model.contains("large") { "3072" } else { "1536" }
+    );
+    println!("  门控：{}", if config.gate.enabled { "✅ 已启用" } else { "⏸ 已禁用" });
+    println!("  验证：{}", if config.verify.enabled { "✅ 已启用" } else { "⏸ 已禁用" });
+    println!("  回滚：{}", if config.rollback.enabled { "✅ 已启用" } else { "⏸ 已禁用" });
+    println!("  协调器：{}", if config.coordinator.enabled { "✅ 已启用" } else { "⏸ 已禁用" });
+    println!("  6/6 Agent 就绪");
+    println!();
+    println!("  LLM 提供商: {}", config.llm.provider);
+    println!("  模型: {}", config.llm.model);
+    if config.llm.api_key.is_empty() {
+        println!("  ⚠ api_key 未配置 → 使用 MockLLMClient（无真实 AI 能力）");
+        println!("  设置环境变量以启用: DEEPSEEK_API_KEY 或 OPENAI_API_KEY");
+    } else {
+        println!("  ✅ api_key 已配置");
     }
 
     Ok(())

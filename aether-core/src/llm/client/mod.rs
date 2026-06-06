@@ -1,3 +1,12 @@
+//! LLM 客户端模块
+//!
+//! 提供 LLMClient trait 及多种实现：
+//! - MockLLMClient: 测试用假客户端
+//! - RetryLLMClient: 带重试和降级的装饰器
+//! - DeepSeekClient / OpenAICompatibleClient: 真实 API 客户端（位于 providers/）
+
+pub mod retry;
+
 use crate::domain::commit::SemanticInfo;
 use crate::utils::Result;
 use serde::{Deserialize, Serialize};

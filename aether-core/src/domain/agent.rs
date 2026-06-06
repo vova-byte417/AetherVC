@@ -112,3 +112,150 @@ impl Default for TaskContext {
         }
     }
 }
+
+// ─── 多 Agent 协调相关类型 ───
+
+/// Agent 身份信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    pub name: String,
+    pub email: String,
+    pub is_ai_agent: bool,
+}
+
+/// 冲突严重程度
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConflictSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+/// 模块热点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleHotspot {
+    pub module_path: String,
+    pub agents_involved: Vec<String>,
+    pub severity: ConflictSeverity,
+    pub overlapping_functions: Vec<String>,
+}
+
+/// 合并排序项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeOrderItem {
+    pub priority: u32,
+    pub agent: String,
+    pub commit_hash: String,
+    pub description: String,
+    pub reason: String,
+}
+
+/// 协调计划
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationPlan {
+    pub summary: String,
+    pub merge_order: Vec<MergeOrderItem>,
+    pub requires_human_review: Vec<String>,
+    pub auto_mergeable: Vec<String>,
+}
+
+/// Agent 冲突矩阵
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConflictMatrix {
+    pub agents: Vec<AgentIdentity>,
+    pub module_agent_counts: std::collections::HashMap<String, std::collections::HashMap<String, u32>>,
+    pub hotspots: Vec<ModuleHotspot>,
+    pub recommendation: CoordinationPlan,
+}
+
+// ─── 回滚相关类型 ───
+
+/// 回滚动作类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RollbackAction {
+    Revert { commit_hash: String },
+    Reset { target_hash: String, hard: bool },
+    NotifyOnly { reason: String },
+}
+
+/// 回滚状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RollbackStatus {
+    PendingApproval,
+    Executed,
+    Failed(String),
+    Cancelled,
+}
+
+/// 回滚请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackRequest {
+    pub commit_hash: String,
+    pub reason: String,
+    pub action: RollbackAction,
+    pub require_approval: bool,
+}
+
+/// 回滚记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackRecord {
+    pub id: String,
+    pub rolled_back_commit: String,
+    pub revert_commit: Option<String>,
+    pub reason: String,
+    pub action: String,
+    pub status: RollbackStatus,
+    pub executed_at: DateTime<Utc>,
+    pub agent_name: String,
+}
+
+// ─── Tag 验证相关类型 ───
+
+/// Tag 排序方式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TagOrderBy {
+    RiskAsc,
+    RiskDesc,
+    Chronological,
+}
+
+/// Tag 验证请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagValidationRequest {
+    pub tags: Vec<String>,
+    pub order_by: TagOrderBy,
+    pub filter_keyword: Option<String>,
+    pub max_tags: usize,
+}
+
+/// 验证结论
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ValidationConclusion {
+    Pass,
+    ConditionalPass(Vec<String>),
+    Fail(Vec<String>),
+}
+
+/// Tag 风险评估
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagRiskAssessment {
+    pub tag: String,
+    pub commit_hash: String,
+    pub risk_score: f32,
+    pub risk_level: String,
+    pub change_type: String,
+    pub affected_modules: Vec<String>,
+    pub agent_name: String,
+}
+
+/// Tag 验证报告
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagValidationReport {
+    pub tag: String,
+    pub commit_hash: String,
+    pub agent: String,
+    pub risk_assessment: TagRiskAssessment,
+    pub overall_conclusion: String,
+    pub verification_details: Option<serde_json::Value>,
+}

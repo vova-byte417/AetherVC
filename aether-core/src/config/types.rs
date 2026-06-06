@@ -18,6 +18,15 @@ pub struct AetherConfig {
     /// LLM 配置
     #[serde(default)]
     pub llm: LLMConfig,
+    /// 回滚配置
+    #[serde(default)]
+    pub rollback: RollbackConfig,
+    /// 协调器配置
+    #[serde(default)]
+    pub coordinator: CoordinatorConfig,
+    /// 存储配置
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 impl Default for AetherConfig {
@@ -26,6 +35,9 @@ impl Default for AetherConfig {
             gate: GateConfig::default(),
             verify: VerifyConfig::default(),
             llm: LLMConfig::default(),
+            rollback: RollbackConfig::default(),
+            coordinator: CoordinatorConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -320,6 +332,12 @@ pub struct LLMConfig {
     /// 温度参数
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Embedding 模型名称
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    /// 失败重试次数（0 = 不重试，1 = 尝试一次，>1 = 多次重试）
+    #[serde(default = "default_retries")]
+    pub max_retries: u32,
     /// 降级策略
     #[serde(default)]
     pub fallback: LLMFallbackConfig,
@@ -329,6 +347,8 @@ fn default_provider() -> String { "deepseek".into() }
 fn default_model() -> String { "deepseek-chat".into() }
 fn default_max_tokens() -> u32 { 4000 }
 fn default_temperature() -> f32 { 0.1 }
+fn default_embedding_model() -> String { "text-embedding-3-small".into() }
+fn default_retries() -> u32 { 3 }
 
 impl Default for LLMConfig {
     fn default() -> Self {
@@ -339,6 +359,8 @@ impl Default for LLMConfig {
             model: "deepseek-chat".into(),
             max_tokens: 4000,
             temperature: 0.1,
+            embedding_model: "text-embedding-3-small".into(),
+            max_retries: 3,
             fallback: LLMFallbackConfig::default(),
         }
     }
@@ -401,6 +423,109 @@ impl GateDecision {
             reason: reason.into(),
             risk_score: risk_score.clamp(0.0, 1.0),
             timestamp: chrono::Utc::now(),
+        }
+    }
+}
+
+// ─── 回滚配置 ───
+
+/// 回滚配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackConfig {
+    /// 全局开关
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// 编译失败自动回滚
+    #[serde(default = "default_true")]
+    pub auto_rollback_on_compile_failure: bool,
+    /// 测试失败自动回滚
+    #[serde(default)]
+    pub auto_rollback_on_test_failure: bool,
+    /// 测试失败率阈值
+    #[serde(default = "default_test_failure_threshold")]
+    pub test_failure_threshold: f32,
+    /// 安全漏洞立即回滚
+    #[serde(default = "default_true")]
+    pub auto_rollback_on_security_cve: bool,
+    /// 回滚是否需要人类确认
+    #[serde(default = "default_true")]
+    pub require_human_approval: bool,
+    /// 每小时最大自动回滚次数
+    #[serde(default = "default_max_rollbacks")]
+    pub max_auto_rollbacks_per_hour: u32,
+}
+
+fn default_test_failure_threshold() -> f32 { 0.1 }
+fn default_max_rollbacks() -> u32 { 3 }
+
+impl Default for RollbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_rollback_on_compile_failure: true,
+            auto_rollback_on_test_failure: false,
+            test_failure_threshold: 0.1,
+            auto_rollback_on_security_cve: true,
+            require_human_approval: true,
+            max_auto_rollbacks_per_hour: 3,
+        }
+    }
+}
+
+// ─── 协调器配置 ───
+
+/// 多 Agent 协调器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinatorConfig {
+    /// 全局开关
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// 多少 Agent 同时修改同一模块视为热点
+    #[serde(default = "default_hotspot_threshold")]
+    pub hotspot_threshold: u32,
+    /// 监控时间窗口（分钟）
+    #[serde(default = "default_monitor_window")]
+    pub monitor_window_minutes: u32,
+    /// 低风险冲突自动解决
+    #[serde(default = "default_true")]
+    pub auto_resolve_low_risk: bool,
+}
+
+fn default_hotspot_threshold() -> u32 { 2 }
+fn default_monitor_window() -> u32 { 120 }
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotspot_threshold: 2,
+            monitor_window_minutes: 120,
+            auto_resolve_low_risk: true,
+        }
+    }
+}
+
+// ─── 存储配置 ───
+
+/// 存储后端配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 存储后端: "memory" | "persistent"
+    #[serde(default = "default_storage_backend")]
+    pub backend: String,
+    /// 持久化数据目录（相对于仓库根目录，默认为 .aether）
+    #[serde(default = "default_storage_data_dir")]
+    pub data_dir: String,
+}
+
+fn default_storage_backend() -> String { "persistent".into() }
+fn default_storage_data_dir() -> String { ".aether".into() }
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "persistent".into(),
+            data_dir: ".aether".into(),
         }
     }
 }
