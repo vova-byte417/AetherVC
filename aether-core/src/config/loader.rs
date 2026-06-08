@@ -158,7 +158,15 @@ impl ConfigLoader {
             "gate.thresholds.max_lines_added" => config.gate.thresholds.max_lines_added = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "gate.thresholds.max_lines_deleted" => config.gate.thresholds.max_lines_deleted = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "gate.thresholds.max_commits_per_hour" => config.gate.thresholds.max_commits_per_hour = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
-            _ => return Err(AetherError::Config(format!("未知配置项: {}。支持的配置项: gate.enabled, llm.provider, llm.model, llm.api_key, llm.temperature, verify.enabled, gate.thresholds.max_files_changed, gate.thresholds.max_lines_added, gate.thresholds.max_lines_deleted, gate.thresholds.max_commits_per_hour", key))),
+            "storage.backend" => {
+                let v = value.to_string();
+                if v != "memory" && v != "persistent" {
+                    return Err(AetherError::Config(format!("storage.backend 必须是 memory 或 persistent，当前值: {}", v)));
+                }
+                config.storage.backend = v;
+            }
+            "storage.data_dir" => config.storage.data_dir = value.to_string(),
+            _ => return Err(AetherError::Config(format!("未知配置项: {}。支持的配置项: gate.enabled, llm.provider, llm.model, llm.api_key, llm.temperature, verify.enabled, gate.thresholds.max_files_changed, gate.thresholds.max_lines_added, gate.thresholds.max_lines_deleted, gate.thresholds.max_commits_per_hour, storage.backend, storage.data_dir", key))),
         }
 
         self.save(&config)
