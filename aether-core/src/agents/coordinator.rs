@@ -276,3 +276,144 @@ impl Agent for MultiAgentCoordinatorAgent {
         self.status.lock().unwrap().clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::client::MockLLMClient;
+    use crate::semantic::embedder::MockEmbedder;
+    use crate::storage::git::GitRepository;
+    use crate::storage::graph_db::InMemoryGraphStore;
+    use crate::storage::vector_db::InMemoryVectorStore;
+
+    fn test_context() -> Arc<AgentContext> {
+        Arc::new(
+            AgentContext::new(
+                Arc::new(GitRepository::new(".")),
+                Arc::new(InMemoryVectorStore::new()),
+                Arc::new(InMemoryGraphStore::new()),
+                Arc::new(MockEmbedder::default()),
+            )
+            .with_llm(Arc::new(MockLLMClient::new())),
+        )
+    }
+
+    /// 空热点列表 → plan 标记零个热点
+    #[test]
+    fn test_rule_based_plan_empty_hotspots() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let plan = agent.rule_based_coordination_plan(&[]);
+        assert!(plan.summary.contains("0 个热点模块"));
+    }
+
+    /// High 级别热点需要人工审核
+    #[test]
+    fn test_rule_based_plan_high_severity() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let hotspots = vec![ModuleHotspot {
+            module_path: "auth/".to_string(),
+            agents_involved: vec!["Cline".to_string(), "Copilot".to_string(), "Claude".to_string()],
+            severity: ConflictSeverity::High,
+            overlapping_functions: vec![],
+        }];
+        let plan = agent.rule_based_coordination_plan(&hotspots);
+        assert!(!plan.requires_human_review.is_empty());
+        assert!(plan.requires_human_review[0].contains("auth/"));
+    }
+
+    /// Critical 严重程度 → 需要人工介入，无可自动合并
+    #[test]
+    fn test_rule_based_plan_critical_severity() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let hotspots = vec![ModuleHotspot {
+            module_path: "database/".to_string(),
+            agents_involved: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            severity: ConflictSeverity::Critical,
+            overlapping_functions: vec![],
+        }];
+        let plan = agent.rule_based_coordination_plan(&hotspots);
+        assert!(!plan.requires_human_review.is_empty());
+        assert!(plan.auto_mergeable.is_empty());
+    }
+
+    /// Medium 级别自动合并
+    #[test]
+    fn test_rule_based_plan_medium_severity() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let hotspots = vec![ModuleHotspot {
+            module_path: "docs/".to_string(),
+            agents_involved: vec!["Copilot".to_string(), "Cline".to_string()],
+            severity: ConflictSeverity::Medium,
+            overlapping_functions: vec![],
+        }];
+        let plan = agent.rule_based_coordination_plan(&hotspots);
+        assert!(plan.requires_human_review.is_empty());
+        assert!(!plan.auto_mergeable.is_empty());
+    }
+
+    /// extract_section 正确过滤关键字行
+    #[test]
+    fn test_extract_section() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let content = "可自动合并: auth/login.rs\n需要人工介入: database/schema.rs\n可自动合并: docs/readme.md";
+        let auto = agent.extract_section(content, "可自动合并");
+        let human = agent.extract_section(content, "需要人工介入");
+        assert_eq!(auto.len(), 2);
+        assert_eq!(human.len(), 1);
+    }
+
+    /// parse_llm_coordination_plan 正确提取 summary
+    #[test]
+    fn test_parse_llm_coordination_plan() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let content = "协调建议摘要\n可自动合并: auth/login.rs\n需要人工介入: database/schema.rs";
+        let plan = agent.parse_llm_coordination_plan(content);
+        assert_eq!(plan.summary, "协调建议摘要");
+        assert!(!plan.auto_mergeable.is_empty());
+        assert!(!plan.requires_human_review.is_empty());
+    }
+
+    /// build_coordination_prompt 包含模块和 Agent 信息
+    #[test]
+    fn test_build_coordination_prompt() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let hotspots = vec![ModuleHotspot {
+            module_path: "auth/".to_string(),
+            agents_involved: vec!["Cline".to_string(), "Copilot".to_string()],
+            severity: ConflictSeverity::High,
+            overlapping_functions: vec![],
+        }];
+        let prompt = agent.build_coordination_prompt(&hotspots);
+        assert!(prompt.contains("auth/"));
+        assert!(prompt.contains("Cline"));
+        assert!(prompt.contains("Copilot"));
+    }
+
+    /// execute 返回冲突矩阵
+    #[tokio::test]
+    async fn test_execute_coordinate_agents() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        let task = AgentTask::new("coordinate_agents", serde_json::json!({}));
+        match agent.execute(task).await {
+            Ok(result) => {
+                assert!(result.success);
+                assert!(result.output.get("agents").is_some());
+            }
+            Err(e) => {
+                // 如果 Git 仓库不可用（如 WSL 中路径不对），跳过不报错
+                if e.to_string().contains("repository") || e.to_string().contains("Git") {
+                    eprintln!("Skipping: git repo not available at '.' ({})", e);
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
+        }
+    }
+
+    /// agent_type 返回正确的 AgentType
+    #[test]
+    fn test_agent_type() {
+        let agent = MultiAgentCoordinatorAgent::new(test_context());
+        assert_eq!(agent.agent_type(), AgentType::MultiAgentCoordinator);
+    }
+}

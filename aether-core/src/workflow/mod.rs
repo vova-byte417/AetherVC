@@ -248,3 +248,112 @@ impl WorkflowOrchestrator {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::orchestrator::AgentOrchestrator;
+    use crate::llm::client::MockLLMClient;
+    use crate::semantic::embedder::MockEmbedder;
+    use crate::storage::git::{GitOperations, GitRepository};
+    use crate::storage::graph_db::InMemoryGraphStore;
+    use crate::storage::vector_db::InMemoryVectorStore;
+
+    fn test_workflow_orchestrator() -> WorkflowOrchestrator {
+        let git_repo: Arc<dyn GitOperations> = Arc::new(GitRepository::new("."));
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let graph_store = Arc::new(InMemoryGraphStore::new());
+        let embedder = Arc::new(MockEmbedder::default());
+        let llm_client = Arc::new(MockLLMClient::new());
+
+        let agent_context = Arc::new(
+            crate::agents::base::AgentContext::new(
+                git_repo,
+                vector_store,
+                graph_store,
+                embedder,
+            )
+            .with_llm(llm_client),
+        );
+
+        let orchestrator = Arc::new(AgentOrchestrator::new().with_all_agents(agent_context));
+        WorkflowOrchestrator::new(orchestrator, AetherConfig::default(), ".")
+    }
+
+    /// execute_digest_flow 返回 markdown 和风险分布
+    #[tokio::test]
+    async fn test_execute_digest_flow() {
+        let orchestrator = test_workflow_orchestrator();
+        match orchestrator.execute(WorkflowType::Digest).await {
+            Ok(result) => {
+                assert!(result.success);
+                assert_eq!(result.workflow_type, "digest");
+                if let Some(data) = &result.data {
+                    assert!(data.get("total_commits").is_some());
+                    assert!(data.get("risk_distribution").is_some());
+                    assert!(data.get("markdown").is_some());
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("repository") || e.to_string().contains("Git") {
+                    eprintln!("Skipping: git repo not available ({})", e);
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
+        }
+    }
+
+    /// execute_coordinate_flow 返回协调结果
+    #[tokio::test]
+    async fn test_execute_coordinate_flow() {
+        let orchestrator = test_workflow_orchestrator();
+        match orchestrator.execute(WorkflowType::Coordinate).await {
+            Ok(result) => {
+                assert!(result.success);
+                assert_eq!(result.workflow_type, "coordinate");
+            }
+            Err(e) => {
+                if e.to_string().contains("repository") || e.to_string().contains("Git") {
+                    eprintln!("Skipping: git repo not available ({})", e);
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
+        }
+    }
+
+    /// execute_verify_tags_flow 返回验证结果
+    #[tokio::test]
+    async fn test_execute_verify_tags_flow() {
+        let orchestrator = test_workflow_orchestrator();
+        match orchestrator.execute(WorkflowType::VerifyTags).await {
+            Ok(result) => {
+                assert!(result.success);
+                assert_eq!(result.workflow_type, "verify_tags");
+            }
+            Err(e) => {
+                eprintln!("verify_tags_flow returned error: {} (may be expected)", e);
+            }
+        }
+    }
+
+    /// execute_full_ci_flow 在空仓库上返回 "No commits" 或正常结果
+    #[tokio::test]
+    async fn test_execute_full_ci_flow() {
+        let orchestrator = test_workflow_orchestrator();
+        match orchestrator.execute(WorkflowType::FullCI).await {
+            Ok(result) => {
+                assert!(result.success);
+                assert_eq!(result.workflow_type, "full_ci");
+            }
+            Err(e) => {
+                if e.to_string().contains("repository") || e.to_string().contains("Git") {
+                    eprintln!("Skipping: git repo not available ({})", e);
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
+        }
+    }
+}

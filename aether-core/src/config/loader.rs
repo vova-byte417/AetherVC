@@ -152,12 +152,27 @@ impl ConfigLoader {
             "llm.provider" => config.llm.provider = value.to_string(),
             "llm.model" => config.llm.model = value.to_string(),
             "llm.api_key" => config.llm.api_key = value.to_string(),
+            "llm.api_base" => config.llm.api_base = value.to_string(),
             "llm.temperature" => config.llm.temperature = value.parse().map_err(|_| AetherError::Config(format!("无法解析浮点数: {}", value)))?,
+            "llm.max_tokens" => config.llm.max_tokens = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
+            "llm.embedding_model" => config.llm.embedding_model = value.to_string(),
+            "llm.max_retries" => config.llm.max_retries = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "verify.enabled" => config.verify.enabled = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
             "gate.thresholds.max_files_changed" => config.gate.thresholds.max_files_changed = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "gate.thresholds.max_lines_added" => config.gate.thresholds.max_lines_added = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "gate.thresholds.max_lines_deleted" => config.gate.thresholds.max_lines_deleted = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
             "gate.thresholds.max_commits_per_hour" => config.gate.thresholds.max_commits_per_hour = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
+            "rollback.enabled" => config.rollback.enabled = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "rollback.auto_rollback_on_compile_failure" => config.rollback.auto_rollback_on_compile_failure = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "rollback.auto_rollback_on_test_failure" => config.rollback.auto_rollback_on_test_failure = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "rollback.test_failure_threshold" => config.rollback.test_failure_threshold = value.parse().map_err(|_| AetherError::Config(format!("无法解析浮点数: {}", value)))?,
+            "rollback.auto_rollback_on_security_cve" => config.rollback.auto_rollback_on_security_cve = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "rollback.require_human_approval" => config.rollback.require_human_approval = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "rollback.max_auto_rollbacks_per_hour" => config.rollback.max_auto_rollbacks_per_hour = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
+            "coordinator.enabled" => config.coordinator.enabled = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
+            "coordinator.hotspot_threshold" => config.coordinator.hotspot_threshold = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
+            "coordinator.monitor_window_minutes" => config.coordinator.monitor_window_minutes = value.parse().map_err(|_| AetherError::Config(format!("无法解析整数: {}", value)))?,
+            "coordinator.auto_resolve_low_risk" => config.coordinator.auto_resolve_low_risk = value.parse().map_err(|_| AetherError::Config(format!("无法解析布尔值: {}", value)))?,
             "storage.backend" => {
                 let v = value.to_string();
                 if v != "memory" && v != "persistent" {
@@ -166,7 +181,7 @@ impl ConfigLoader {
                 config.storage.backend = v;
             }
             "storage.data_dir" => config.storage.data_dir = value.to_string(),
-            _ => return Err(AetherError::Config(format!("未知配置项: {}。支持的配置项: gate.enabled, llm.provider, llm.model, llm.api_key, llm.temperature, verify.enabled, gate.thresholds.max_files_changed, gate.thresholds.max_lines_added, gate.thresholds.max_lines_deleted, gate.thresholds.max_commits_per_hour, storage.backend, storage.data_dir", key))),
+            _ => return Err(AetherError::Config(format!("未知配置项: {}。支持的配置项: gate.enabled, llm.provider, llm.model, llm.api_key, llm.api_base, llm.temperature, llm.max_tokens, llm.embedding_model, llm.max_retries, verify.enabled, gate.thresholds.max_files_changed, gate.thresholds.max_lines_added, gate.thresholds.max_lines_deleted, gate.thresholds.max_commits_per_hour, rollback.enabled, rollback.auto_rollback_on_compile_failure, rollback.auto_rollback_on_test_failure, rollback.test_failure_threshold, rollback.auto_rollback_on_security_cve, rollback.require_human_approval, rollback.max_auto_rollbacks_per_hour, coordinator.enabled, coordinator.hotspot_threshold, coordinator.monitor_window_minutes, coordinator.auto_resolve_low_risk, storage.backend, storage.data_dir", key))),
         }
 
         self.save(&config)
@@ -238,5 +253,75 @@ mod tests {
         loader.set_value("llm.model", "gpt-3.5-turbo").unwrap();
         let config = loader.load().unwrap();
         assert_eq!(config.llm.model, "gpt-3.5-turbo");
+    }
+
+    #[test]
+    fn test_set_value_rollback_keys() {
+        let (_dir, loader) = setup_test_env();
+        loader.init().unwrap();
+
+        loader.set_value("rollback.enabled", "false").unwrap();
+        let config = loader.load().unwrap();
+        assert!(!config.rollback.enabled);
+
+        loader.set_value("rollback.test_failure_threshold", "0.25").unwrap();
+        let config = loader.load().unwrap();
+        assert!((config.rollback.test_failure_threshold - 0.25).abs() < 1e-5);
+
+        loader.set_value("rollback.require_human_approval", "false").unwrap();
+        let config = loader.load().unwrap();
+        assert!(!config.rollback.require_human_approval);
+
+        loader.set_value("rollback.max_auto_rollbacks_per_hour", "5").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.rollback.max_auto_rollbacks_per_hour, 5);
+    }
+
+    #[test]
+    fn test_set_value_coordinator_keys() {
+        let (_dir, loader) = setup_test_env();
+        loader.init().unwrap();
+
+        loader.set_value("coordinator.enabled", "false").unwrap();
+        let config = loader.load().unwrap();
+        assert!(!config.coordinator.enabled);
+
+        loader.set_value("coordinator.hotspot_threshold", "5").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.coordinator.hotspot_threshold, 5);
+
+        loader.set_value("coordinator.monitor_window_minutes", "60").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.coordinator.monitor_window_minutes, 60);
+    }
+
+    #[test]
+    fn test_set_value_llm_extra_keys() {
+        let (_dir, loader) = setup_test_env();
+        loader.init().unwrap();
+
+        loader.set_value("llm.embedding_model", "text-embedding-3-large").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.llm.embedding_model, "text-embedding-3-large");
+
+        loader.set_value("llm.max_retries", "5").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.llm.max_retries, 5);
+
+        loader.set_value("llm.max_tokens", "8000").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.llm.max_tokens, 8000);
+
+        loader.set_value("llm.api_base", "https://custom.api.com/v1").unwrap();
+        let config = loader.load().unwrap();
+        assert_eq!(config.llm.api_base, "https://custom.api.com/v1");
+    }
+
+    #[test]
+    fn test_set_value_unknown_key() {
+        let (_dir, loader) = setup_test_env();
+        loader.init().unwrap();
+        let result = loader.set_value("nonexistent.key", "value");
+        assert!(result.is_err());
     }
 }

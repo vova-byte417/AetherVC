@@ -180,18 +180,182 @@ impl RollbackAgent {
         Ok(record)
     }
 
-    /// 执行 git revert
-    async fn perform_git_revert(&self, _commit_hash: &str) -> Result<Option<String>> {
-        // 实际项目中通过 git2 库执行 revert
-        // 这里返回模拟的新 revert commit hash
-        let new_hash = format!("revert-{}", Utc::now().timestamp());
-        tracing::info!("[RollbackAgent] 执行 git revert: new_commit={}", new_hash);
+    /// 执行 git revert（真实 git2 操作）
+    async fn perform_git_revert(&self, commit_hash: &str) -> Result<Option<String>> {
+        use git2::{Oid, Repository};
+
+        let repo_path = self.context.git_repo.repo_path();
+        let repo = Repository::open(repo_path).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 无法打开仓库 {}: {}",
+                repo_path.display(),
+                e
+            ))
+        })?;
+
+        let oid = Oid::from_str(commit_hash).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 无效的 commit hash '{}': {}",
+                commit_hash, e
+            ))
+        })?;
+
+        let commit = repo.find_commit(oid).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 找不到 commit '{}': {}",
+                commit_hash, e
+            ))
+        })?;
+
+        // 获取 HEAD commit
+        let head = repo.head().map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 无法获取 HEAD: {}",
+                e
+            ))
+        })?;
+        let head_commit = head.peel_to_commit().map_err(|e| {
+            crate::utils::AetherError::Git(format!("[RollbackAgent] HEAD 解析失败: {}", e))
+        })?;
+
+        // 使用 git revert 产生反向 patch 并写入 index
+        // git2 0.19 API: revert_commit(commit, our_commit, mainline, merge_options)
+        let mut index = repo
+            .revert_commit(&commit, &head_commit, 1, None)
+            .map_err(|e| {
+                crate::utils::AetherError::Git(format!(
+                    "[RollbackAgent] revert 失败 '{}': {}",
+                    commit_hash, e
+                ))
+            })?;
+
+        // 检查冲突
+        if index.has_conflicts() {
+            return Err(crate::utils::AetherError::AgentError(
+                "Revert 存在冲突，需要手动解决".to_string(),
+            ));
+        }
+
+        // 写入 tree
+        let tree_id = index.write_tree_to(&repo).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 写入 tree 失败: {}",
+                e
+            ))
+        })?;
+        let tree = repo.find_tree(tree_id).map_err(|e| {
+            crate::utils::AetherError::Git(format!("[RollbackAgent] 查找 tree 失败: {}", e))
+        })?;
+
+        // 创建 revert commit
+        let signature = repo.signature().unwrap_or_else(|_| {
+            git2::Signature::now("AetherVC", "rollback@aether.vc").unwrap()
+        });
+        let message = format!(
+            "Revert \"{}\"\n\nThis reverts commit {}.\n[Auto-reverted by AetherVC RollbackAgent]",
+            commit.message().unwrap_or("unknown"),
+            commit_hash
+        );
+
+        let new_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&head_commit],
+            )
+            .map_err(|e| {
+                crate::utils::AetherError::Git(format!(
+                    "[RollbackAgent] 创建 revert commit 失败: {}",
+                    e
+                ))
+            })?;
+
+        let new_hash = new_oid.to_string();
+        tracing::info!(
+            "[RollbackAgent] 已创建 revert commit: {} (revert {})",
+            &new_hash[..8.min(new_hash.len())],
+            &commit_hash[..8.min(commit_hash.len())]
+        );
         Ok(Some(new_hash))
     }
 
-    /// 执行 git reset
-    async fn perform_git_reset(&self, _target_hash: &str) -> Result<Option<String>> {
-        tracing::warn!("[RollbackAgent] git reset 是危险操作，需要额外确认");
+    /// 执行 git reset（带 snapshot 保护）
+    async fn perform_git_reset(&self, target_hash: &str) -> Result<Option<String>> {
+        use git2::{Oid, Repository, ResetType};
+
+        let repo_path = self.context.git_repo.repo_path();
+        let repo = Repository::open(repo_path).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 无法打开仓库 {}: {}",
+                repo_path.display(),
+                e
+            ))
+        })?;
+
+        // 先创建 snapshot 保护（backup branch）
+        let snapshot_name = format!(
+            "aether-snapshot-{}",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let head = repo.head().map_err(|e| {
+            crate::utils::AetherError::Git(format!("[RollbackAgent] HEAD 获取失败: {}", e))
+        })?;
+        let head_oid = head.target().ok_or_else(|| {
+            crate::utils::AetherError::Git("[RollbackAgent] HEAD 无 target".into())
+        })?;
+
+        // 创建 snapshot branch
+        let head_commit_obj = repo.find_commit(head_oid).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 查找 HEAD commit 失败: {}",
+                e
+            ))
+        })?;
+        match repo.branch(&snapshot_name, &head_commit_obj, false) {
+            Ok(_) => {
+                tracing::info!(
+                    "[RollbackAgent] 已创建 snapshot branch: {}",
+                    snapshot_name
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[RollbackAgent] 创建 snapshot branch 失败: {}",
+                    e
+                );
+            }
+        }
+
+        // 执行 reset
+        let target_oid = Oid::from_str(target_hash).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 无效的 target hash '{}': {}",
+                target_hash, e
+            ))
+        })?;
+        let target_commit = repo.find_commit(target_oid).map_err(|e| {
+            crate::utils::AetherError::Git(format!(
+                "[RollbackAgent] 找不到 target commit '{}': {}",
+                target_hash, e
+            ))
+        })?;
+
+        repo.reset(target_commit.as_object(), ResetType::Hard, None)
+            .map_err(|e| {
+                crate::utils::AetherError::Git(format!(
+                    "[RollbackAgent] git reset 失败: {}",
+                    e
+                ))
+            })?;
+
+        tracing::info!(
+            "[RollbackAgent] 已执行 git reset --hard to {}; snapshot 保存在 {}",
+            target_hash,
+            snapshot_name
+        );
         Ok(None)
     }
 
@@ -345,5 +509,220 @@ impl Agent for RollbackAgent {
 
     fn status(&self) -> AgentStatus {
         self.status.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::base::AgentContext;
+    use crate::llm::client::MockLLMClient;
+    use crate::semantic::embedder::MockEmbedder;
+    use crate::storage::git::GitRepository;
+    use crate::storage::graph_db::InMemoryGraphStore;
+    use crate::storage::vector_db::InMemoryVectorStore;
+
+    fn test_context() -> Arc<AgentContext> {
+        Arc::new(
+            AgentContext::new(
+                Arc::new(GitRepository::new(".")),
+                Arc::new(InMemoryVectorStore::new()),
+                Arc::new(InMemoryGraphStore::new()),
+                Arc::new(MockEmbedder::default()),
+            )
+            .with_llm(Arc::new(MockLLMClient::new())),
+        )
+    }
+
+    fn test_config() -> RollbackConfig {
+        RollbackConfig {
+            enabled: true,
+            auto_rollback_on_compile_failure: true,
+            auto_rollback_on_test_failure: false,
+            test_failure_threshold: 0.1,
+            auto_rollback_on_security_cve: true,
+            require_human_approval: false,
+            max_auto_rollbacks_per_hour: 3,
+        }
+    }
+
+    /// 编译失败 + auto_rollback_on_compile_failure=true → 返回 Revert
+    #[tokio::test]
+    async fn test_analyze_compile_failure() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let result = agent
+            .analyze_need_rollback(
+                "abc123",
+                &serde_json::json!({
+                    "checks": [
+                        {"name": "compile", "status": "failed", "duration_ms": 500},
+                        {"name": "lint", "status": "passed", "duration_ms": 300},
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        match result.unwrap() {
+            RollbackAction::Revert { commit_hash } => assert_eq!(commit_hash, "abc123"),
+            _ => panic!("Expected Revert action"),
+        }
+    }
+
+    /// 安全漏洞 + auto_rollback_on_security_cve=true → 返回 Revert
+    #[tokio::test]
+    async fn test_analyze_security_issue() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let result = agent
+            .analyze_need_rollback(
+                "def456",
+                &serde_json::json!({
+                    "checks": [
+                        {"name": "compile", "status": "passed"},
+                        {"name": "security_scan", "status": "failed"},
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        match result.unwrap() {
+            RollbackAction::Revert { commit_hash } => assert_eq!(commit_hash, "def456"),
+            _ => panic!("Expected Revert action for security issue"),
+        }
+    }
+
+    /// 测试失败率 50% > 阈值 10% → 返回 NotifyOnly
+    #[tokio::test]
+    async fn test_analyze_test_failure_threshold_exceeded() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let result = agent
+            .analyze_need_rollback(
+                "ghi789",
+                &serde_json::json!({
+                    "checks": [
+                        {"name": "compile", "status": "passed"},
+                        {"name": "test_a", "status": "failed"},
+                        {"name": "test_b", "status": "passed"},
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        // auto_rollback_on_test_failure=false, 所以应返回 NotifyOnly
+        assert!(result.is_some());
+        match result.unwrap() {
+            RollbackAction::NotifyOnly { .. } => {}
+            _ => panic!("Expected NotifyOnly action"),
+        }
+    }
+
+    /// 全部通过 → 无需回滚
+    #[tokio::test]
+    async fn test_analyze_all_passed() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let result = agent
+            .analyze_need_rollback(
+                "jkl012",
+                &serde_json::json!({
+                    "checks": [
+                        {"name": "compile", "status": "passed"},
+                        {"name": "test_a", "status": "passed"},
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    /// config.enabled=false → 永远不触发回滚
+    #[tokio::test]
+    async fn test_analyze_disabled_config() {
+        let mut cfg = test_config();
+        cfg.enabled = false;
+        let agent = RollbackAgent::new(test_context(), cfg);
+        let result = agent
+            .analyze_need_rollback(
+                "abc",
+                &serde_json::json!({
+                    "checks": [{"name": "compile", "status": "failed"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    /// 更新信誉分
+    #[test]
+    fn test_update_reputation() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        agent.update_reputation("Cline", -0.05);
+        let score = agent.get_reputation("Cline");
+        assert!((score - 0.95).abs() < 1e-5);
+    }
+
+    /// execute "analyze_rollback" 任务
+    #[tokio::test]
+    async fn test_execute_analyze_rollback() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let task = AgentTask::new(
+            "analyze_rollback",
+            serde_json::json!({
+                "commit_hash": "abc123",
+                "verification_result": {
+                    "checks": [
+                        {"name": "compile", "status": "failed"}
+                    ]
+                }
+            }),
+        );
+        let result = agent.execute(task).await.unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.output.get("needs_rollback").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    /// execute "reputation" 任务
+    #[tokio::test]
+    async fn test_execute_reputation() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        agent.update_reputation("Claude", 0.0); // 初始化
+        let task = AgentTask::new("reputation", serde_json::json!({}));
+        let result = agent.execute(task).await.unwrap();
+        assert!(result.success);
+    }
+
+    /// execute 未知任务类型 → 失败
+    #[tokio::test]
+    async fn test_execute_unknown_task() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        let task = AgentTask::new("unknown_task", serde_json::json!({}));
+        let result = agent.execute(task).await.unwrap();
+        assert!(!result.success);
+    }
+
+    /// agent_type 返回正确的 AgentType
+    #[test]
+    fn test_agent_type() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        assert_eq!(agent.agent_type(), AgentType::Rollback);
+    }
+
+    /// 历史记录初始为空
+    #[test]
+    fn test_history_starts_empty() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        assert!(agent.get_history().is_empty());
+    }
+
+    /// 信誉分初始为 1.0
+    #[test]
+    fn test_reputation_starts_at_one() {
+        let agent = RollbackAgent::new(test_context(), test_config());
+        assert_eq!(agent.get_reputation("unknown_agent"), 1.0);
     }
 }

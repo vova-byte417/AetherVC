@@ -293,3 +293,149 @@ impl Agent for ValidationRiskAgent {
         self.status.lock().unwrap().clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::client::MockLLMClient;
+    use crate::semantic::embedder::MockEmbedder;
+    use crate::storage::git::GitRepository;
+    use crate::storage::graph_db::InMemoryGraphStore;
+    use crate::storage::vector_db::InMemoryVectorStore;
+
+    fn test_context() -> Arc<AgentContext> {
+        Arc::new(
+            AgentContext::new(
+                Arc::new(GitRepository::new(".")),
+                Arc::new(InMemoryVectorStore::new()),
+                Arc::new(InMemoryGraphStore::new()),
+                Arc::new(MockEmbedder::default()),
+            )
+            .with_llm(Arc::new(MockLLMClient::new())),
+        )
+    }
+
+    /// breaking + auth 模块 → 风险接近 1.0
+    #[test]
+    fn test_calculate_risk_score_high() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let score = agent.calculate_risk_score(
+            "breaking",
+            &["auth/login.rs".to_string()],
+            "high",
+        );
+        assert!(score > 0.7, "Expected high risk score, got {}", score);
+    }
+
+    /// documentation + docs/ → 风险接近 0.0
+    #[test]
+    fn test_calculate_risk_score_low() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let score = agent.calculate_risk_score(
+            "documentation",
+            &["docs/readme.md".to_string()],
+            "low",
+        );
+        assert!(score < 0.3, "Expected low risk score, got {}", score);
+    }
+
+    /// bugfix + api/ → 中等风险
+    #[test]
+    fn test_calculate_risk_score_medium() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let score = agent.calculate_risk_score(
+            "bugfix",
+            &["api/handler.rs".to_string()],
+            "medium",
+        );
+        assert!(score > 0.2 && score < 0.7);
+    }
+
+    /// security_hardening → 高分
+    #[test]
+    fn test_calculate_risk_score_security() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let score = agent.calculate_risk_score(
+            "security_hardening",
+            &[],
+            "high",
+        );
+        assert!(score > 0.6);
+    }
+
+    /// RiskAsc 排序：低风险在前
+    #[test]
+    fn test_sort_tags_risk_asc() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let mut assessments = vec![
+            TagRiskAssessment {
+                tag: "high".into(), commit_hash: "c1".into(),
+                risk_score: 0.9, risk_level: "high".into(),
+                change_type: "breaking".into(), affected_modules: vec![],
+                agent_name: "A".into(),
+            },
+            TagRiskAssessment {
+                tag: "low".into(), commit_hash: "c2".into(),
+                risk_score: 0.1, risk_level: "low".into(),
+                change_type: "documentation".into(), affected_modules: vec![],
+                agent_name: "B".into(),
+            },
+        ];
+        agent.sort_tags(&mut assessments, &TagOrderBy::RiskAsc);
+        assert_eq!(assessments[0].tag, "low");
+        assert_eq!(assessments[1].tag, "high");
+    }
+
+    /// RiskDesc 排序：高风险在前
+    #[test]
+    fn test_sort_tags_risk_desc() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let mut assessments = vec![
+            TagRiskAssessment {
+                tag: "low".into(), commit_hash: "c1".into(),
+                risk_score: 0.1, risk_level: "low".into(),
+                change_type: "doc".into(), affected_modules: vec![],
+                agent_name: "A".into(),
+            },
+            TagRiskAssessment {
+                tag: "high".into(), commit_hash: "c2".into(),
+                risk_score: 0.9, risk_level: "high".into(),
+                change_type: "breaking".into(), affected_modules: vec![],
+                agent_name: "B".into(),
+            },
+        ];
+        agent.sort_tags(&mut assessments, &TagOrderBy::RiskDesc);
+        assert_eq!(assessments[0].tag, "high");
+        assert_eq!(assessments[1].tag, "low");
+    }
+
+    /// resolve_tag_to_commit: 完整 hex hash 直接返回
+    #[tokio::test]
+    async fn test_resolve_tag_full_hex_hash() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let hex = "0123456789abcdef0123456789abcdef01234567";
+        let result = agent.resolve_tag_to_commit(hex).await.unwrap();
+        assert_eq!(result, hex);
+    }
+
+    /// execute 返回报告列表
+    #[tokio::test]
+    async fn test_execute_empty_tags() {
+        let agent = ValidationRiskAgent::new(test_context());
+        let task = AgentTask::new("validate_tag", serde_json::json!({
+            "tags": [],
+            "keyword": "",
+            "order_by": "risk_asc"
+        }));
+        let result = agent.execute(task).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.to_string().contains("No tags found"));
+    }
+
+    /// agent_type 返回正确的 AgentType
+    #[test]
+    fn test_agent_type() {
+        let agent = ValidationRiskAgent::new(test_context());
+        assert_eq!(agent.agent_type(), AgentType::ValidationRisk);
+    }
+}

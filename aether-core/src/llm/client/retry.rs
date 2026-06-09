@@ -123,3 +123,115 @@ impl LLMClient for RetryLLMClient {
         self.inner.model_name()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 始终成功的客户端
+    struct AlwaysSuccessClient;
+    #[async_trait::async_trait]
+    impl LLMClient for AlwaysSuccessClient {
+        async fn complete(&self, _prompt: &str) -> crate::utils::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: "success".into(),
+                tokens_used: Some(10),
+                model: "test".into(),
+            })
+        }
+        async fn analyze_semantic(&self, _diff: &str, msg: &str) -> crate::utils::Result<SemanticInfo> {
+            Ok(SemanticInfo::new(msg, crate::domain::commit::ChangeCategory::Feature,
+                vec![], msg, crate::domain::commit::RiskLevel::Low))
+        }
+        fn model_name(&self) -> &str { "test" }
+    }
+
+    /// 第一次失败、之后成功的客户端
+    struct FailThenSuccessClient {
+        attempts: std::sync::atomic::AtomicU32,
+    }
+    impl FailThenSuccessClient {
+        fn new() -> Self { Self { attempts: std::sync::atomic::AtomicU32::new(0) } }
+    }
+    #[async_trait::async_trait]
+    impl LLMClient for FailThenSuccessClient {
+        async fn complete(&self, _prompt: &str) -> crate::utils::Result<LLMResponse> {
+            let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 2 {
+                Err(crate::utils::AetherError::LLM("transient error".into()))
+            } else {
+                Ok(LLMResponse { content: "ok".into(), tokens_used: Some(5), model: "test-fail-then-success".into() })
+            }
+        }
+        async fn analyze_semantic(&self, _diff: &str, msg: &str) -> crate::utils::Result<SemanticInfo> {
+            Ok(SemanticInfo::new(msg, crate::domain::commit::ChangeCategory::Feature,
+                vec![], msg, crate::domain::commit::RiskLevel::Low))
+        }
+        fn model_name(&self) -> &str { "test-fail-then-success" }
+    }
+
+    /// 始终失败的客户端
+    struct AlwaysFailClient;
+    #[async_trait::async_trait]
+    impl LLMClient for AlwaysFailClient {
+        async fn complete(&self, _prompt: &str) -> crate::utils::Result<LLMResponse> {
+            Err(crate::utils::AetherError::LLM("always fails".into()))
+        }
+        async fn analyze_semantic(&self, _diff: &str, _msg: &str) -> crate::utils::Result<SemanticInfo> {
+            Err(crate::utils::AetherError::LLM("always fails".into()))
+        }
+        fn model_name(&self) -> &str { "always-fail" }
+    }
+
+    /// 始终成功的客户端 → 一次就返回
+    #[tokio::test]
+    async fn test_retry_success_first_try() {
+        let client = RetryLLMClient::new(Arc::new(AlwaysSuccessClient), 3);
+        let resp = client.complete("hello").await.unwrap();
+        assert_eq!(resp.content, "success");
+        assert_eq!(client.degradation_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// 失败后重试成功
+    #[tokio::test]
+    async fn test_retry_succeeds_after_failure() {
+        let client = RetryLLMClient::new(Arc::new(FailThenSuccessClient::new()), 5);
+        let resp = client.complete("retry-me").await.unwrap();
+        assert_eq!(resp.content, "ok");
+    }
+
+    /// 全部重试失败 → 返回错误
+    #[tokio::test]
+    async fn test_retry_all_fail() {
+        let client = RetryLLMClient::new(Arc::new(AlwaysFailClient), 2);
+        let result = client.complete("fail").await;
+        assert!(result.is_err());
+    }
+
+    /// analyze_semantic 降级到 RuleBasedAnalyzer
+    #[tokio::test]
+    async fn test_retry_analyze_semantic_fallback() {
+        let client = RetryLLMClient::new(Arc::new(AlwaysFailClient), 1);
+        let info = client.analyze_semantic("--- a/lib.rs\n+++ b/lib.rs\n+fn new() {}", "feat: test").await.unwrap();
+        // 降级后仍能返回结果（规则分析器）
+        assert!(!info.intent.is_empty());
+        assert!(client.degradation_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// is_degraded 检查
+    #[tokio::test]
+    async fn test_is_degraded() {
+        let client = RetryLLMClient::new(Arc::new(AlwaysFailClient), 1);
+        assert!(!client.is_degraded());
+        let _ = client.complete("x").await;
+        // complete 不增加 degradation_count（只有 analyze_semantic 降级时才加）
+        assert!(!client.is_degraded());
+    }
+
+    /// model_name 透传
+    #[test]
+    fn test_model_name_passthrough() {
+        let client = RetryLLMClient::new(Arc::new(AlwaysSuccessClient), 3);
+        assert_eq!(client.model_name(), "test");
+    }
+}
